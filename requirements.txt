@@ -1,0 +1,8 @@
+mcp>=1.2.0
+canvasapi
+gradescopeapi
+pandas
+pytz
+httpx
+tqdm
+python-dotenv

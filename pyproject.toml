@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "school-mcp"
+version = "0.1.0"
+description = "MCP Server for School-related functionalities"
+requires-python = ">=3.8"
+dependencies = [
+    "mcp>=1.2.0",
+    "canvasapi",
+    "gradescopeapi",
+    "pandas",
+    "pytz",
+    "httpx",
+    "tqdm",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.3.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["school_mcp"]

@@ -1,0 +1,25 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    properties:
+      envFilePath:
+        type: string
+        default: .env
+        description: Path to the environment file containing configuration variables, if
+          not provided defaults to .env file.
+      useSetupHelper:
+        type: boolean
+        default: false
+        description: Boolean flag to determine whether to run the setup helper script
+          before starting the server.
+  commandFunction:
+    # A JS function that produces the CLI command based on the given config to start the MCP on stdio.
+    |-
+    (config) => { const { useSetupHelper, envFilePath } = config; if(useSetupHelper) { return { command: 'python', args: ['setup_helper.py', '&&', 'python', '-m', 'school_mcp'] }; } else { return { command: 'python', args: ['-m', 'school_mcp'] }; } }
+  exampleConfig:
+    envFilePath: .env
+    useSetupHelper: false

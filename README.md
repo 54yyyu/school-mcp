@@ -1,5 +1,7 @@
 # School MCP
 
+[![smithery badge](https://smithery.ai/badge/@54yyyu/school-mcp)](https://smithery.ai/server/@54yyyu/school-mcp)
+
 A Model Context Protocol (MCP) server for academic tools, integrating with Canvas and Gradescope platforms.
 
 ## Features
@@ -11,6 +13,14 @@ A Model Context Protocol (MCP) server for academic tools, integrating with Canva
 ## Quickstart
 
 ### Installation
+
+#### Installing via Smithery
+
+To install School MCP for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@54yyyu/school-mcp):
+
+```bash
+npx -y @smithery/cli install @54yyyu/school-mcp --client claude
+```
 
 1. Clone the repository:
 ```bash

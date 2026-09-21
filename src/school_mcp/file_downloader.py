@@ -12,10 +12,16 @@ from .config import get_config, get_download_path, save_download_path
 class CanvasDownloader:
     """Class for downloading files from Canvas."""
     
-    def __init__(self):
-        """Initialize Canvas connection."""
+    def __init__(self, account: Optional[str] = None):
+        """
+        Initialize Canvas connection.
+
+        Args:
+            account: Name of the configured account to use (defaults to the active one)
+        """
         try:
-            config = get_config()
+            config = get_config(account)
+            self.account = config['account']
             domain = config['canvas_domain'].replace('https://', '').replace('http://', '')
             self.canvas = Canvas(f'https://{domain}', config['canvas_access_token'])
         except Exception as e:

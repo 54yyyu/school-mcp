@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from gradescopeapi.classes.connection import GSConnection
 from canvasapi import Canvas
-from .config import get_config
+from .config import get_config, has_gradescope
 
 class Platform(Enum):
     """Platforms for assignments."""
@@ -31,17 +31,25 @@ class Assignment:
 class DeadlineScraper:
     """Class for scraping deadlines from Canvas and Gradescope."""
     
-    def __init__(self):
-        """Initialize connections to Canvas and Gradescope."""
+    def __init__(self, account: Optional[str] = None):
+        """
+        Initialize connections to Canvas and, when configured, Gradescope.
+
+        Args:
+            account: Name of the configured account to use (defaults to the active one)
+        """
         try:
-            config = get_config()
+            config = get_config(account)
+            self.account = config['account']
             
-            # Initialize Gradescope
-            self.gs_connection = GSConnection()
-            self.gs_connection.login(
-                config['gradescope_email'], 
-                config['gradescope_password']
-            )
+            # Initialize Gradescope only for accounts that have credentials for it
+            self.gs_connection = None
+            if has_gradescope(config):
+                self.gs_connection = GSConnection()
+                self.gs_connection.login(
+                    config['gradescope_email'], 
+                    config['gradescope_password']
+                )
             
             # Initialize Canvas
             domain = config['canvas_domain'].replace('https://', '').replace('http://', '')
@@ -74,10 +82,25 @@ class DeadlineScraper:
         term, year, _ = self._get_current_term_info()
         return term, year
 
+    def _term_patterns(self, term: str, year: str) -> List[str]:
+        """Common ways a term and year are written inside a course name."""
+        term = term.lower()
+        return [
+            f"{term} {year}",      # "spring 2024"
+            f"{term}{year}",       # "spring2024"
+            f"{year}{term}",       # "2024spring"
+            f"{term}'{year[2:]}",  # "spring'24"
+            f"{term} '{year[2:]}"  # "spring '24"
+        ]
+
     def _is_current_term_course(self, course_name: str) -> bool:
         """
-        Check if a course belongs to the current term based on both standardized
-        course codes and text patterns.
+        Check whether a course belongs to the current term.
+
+        Course names only sometimes carry term information. Canvas has already
+        filtered to active enrollments, so a name with no term information at all
+        (e.g. MIT's "6.7810 Algorithms for Inference") is treated as current; a
+        name is only rejected when it explicitly names a different term.
         """
         current_term, current_year, current_term_code = self._get_current_term_info()
         
@@ -91,21 +114,24 @@ class DeadlineScraper:
         
         # If no match, check text-based patterns
         course_lower = course_name.lower()
-        term_lower = current_term.lower()
         
-        # Common term patterns in text-based course names
-        term_patterns = [
-            f"{term_lower} {current_year}",     # "spring 2024"
-            f"{term_lower}{current_year}",      # "spring2024"
-            f"{current_year}{term_lower}",      # "2024spring"
-            f"{term_lower}'{current_year[2:]}", # "spring'24"
-            f"{term_lower} '{current_year[2:]}" # "spring '24"
-        ]
+        if any(p in course_lower for p in self._term_patterns(current_term, current_year)):
+            return True
         
-        return any(pattern in course_lower for pattern in term_patterns)
+        # Reject only when the name spells out some other term; otherwise the name
+        # carries no term information and we keep the course.
+        now_year = int(current_year)
+        for term in ('spring', 'summer', 'fall', 'autumn', 'winter'):
+            for year in range(now_year - 5, now_year + 2):
+                if any(p in course_lower for p in self._term_patterns(term, str(year))):
+                    return False
+        
+        return True
 
     def get_gradescope_assignments(self, days_ahead: int = 14) -> List[Assignment]:
-        """Get upcoming assignments from Gradescope."""
+        """Get upcoming assignments from Gradescope. Empty when not configured."""
+        if self.gs_connection is None:
+            return []
         try:
             # Get current courses
             courses = self.gs_connection.account.get_courses()

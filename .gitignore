@@ -22,6 +22,9 @@ wheels/
 
 # Environment
 .env
+.env.bak*
+.env.local
+!.env.template
 .venv
 env/
 venv/

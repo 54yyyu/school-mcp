@@ -10,25 +10,85 @@ from mcp.server.fastmcp import FastMCP, Context
 from .deadline_scraper import DeadlineScraper
 from .file_downloader import CanvasDownloader
 from .reminders import ReminderManager
-from .config import get_download_path, save_download_path
+from .config import (
+    get_download_path,
+    save_download_path,
+    list_accounts,
+    get_active_account,
+    set_active_account,
+    get_config,
+    has_gradescope,
+)
 
 # Initialize FastMCP server
 mcp = FastMCP("School Tools")
+
+# =====================
+# Account Tools
+# =====================
+
+@mcp.tool()
+async def list_school_accounts() -> str:
+    """
+    List the configured school accounts (e.g. columbia, mit) and show which one is active.
+    """
+    try:
+        accounts = list_accounts()
+        if not accounts:
+            return "No accounts configured."
+
+        try:
+            active = get_active_account()
+        except ValueError:
+            active = None
+
+        details = []
+        for name in accounts:
+            try:
+                config = get_config(name)
+                details.append({
+                    "account": name,
+                    "canvas_domain": config["canvas_domain"],
+                    "gradescope": has_gradescope(config),
+                    "active": name == active,
+                })
+            except ValueError as e:
+                details.append({"account": name, "error": str(e)})
+
+        return json.dumps(details, indent=2)
+    except Exception as e:
+        return f"Error listing accounts: {str(e)}"
+
+@mcp.tool()
+async def switch_school_account(account: str) -> str:
+    """
+    Switch the active school account. Persists across restarts.
+
+    Args:
+        account: Account name, e.g. "columbia" or "mit"
+    """
+    try:
+        name = set_active_account(account)
+        config = get_config(name)
+        return f"Active account is now '{name}' (Canvas: {config['canvas_domain']})."
+    except Exception as e:
+        return f"Error switching account: {str(e)}"
 
 # =====================
 # Deadline Tools
 # =====================
 
 @mcp.tool()
-async def get_deadlines(days_ahead: int = 14) -> str:
+async def get_deadlines(days_ahead: int = 14, account: Optional[str] = None) -> str:
     """
     Get upcoming deadlines from Canvas and Gradescope.
     
     Args:
         days_ahead: Number of days to look ahead for assignments (default: 14)
+        account: School account to use (defaults to the active account)
     """
     try:
-        scraper = DeadlineScraper()
+        scraper = DeadlineScraper(account)
         assignments = scraper.get_all_assignments(days_ahead)
         
         if not assignments:
@@ -39,16 +99,17 @@ async def get_deadlines(days_ahead: int = 14) -> str:
         return f"Error getting deadlines: {str(e)}"
 
 @mcp.tool()
-async def add_to_reminders(days_ahead: int = 14) -> str:
+async def add_to_reminders(days_ahead: int = 14, account: Optional[str] = None) -> str:
     """
     Add upcoming deadlines to macOS Reminders.
     
     Args:
         days_ahead: Number of days to look ahead for assignments (default: 14)
+        account: School account to use (defaults to the active account)
     """
     try:
         # Get assignments
-        scraper = DeadlineScraper()
+        scraper = DeadlineScraper(account)
         assignments = scraper.get_all_assignments(days_ahead)
         
         if not assignments:
@@ -67,12 +128,15 @@ async def add_to_reminders(days_ahead: int = 14) -> str:
 # =====================
 
 @mcp.tool()
-async def list_courses() -> str:
+async def list_courses(account: Optional[str] = None) -> str:
     """
     List available courses from Canvas.
+
+    Args:
+        account: School account to use (defaults to the active account)
     """
     try:
-        downloader = CanvasDownloader()
+        downloader = CanvasDownloader(account)
         courses = downloader.get_current_courses()
         
         if not courses:
@@ -83,16 +147,17 @@ async def list_courses() -> str:
         return f"Error listing courses: {str(e)}"
 
 @mcp.tool()
-async def download_course_files(course_id: int, download_path: Optional[str] = None) -> str:
+async def download_course_files(course_id: int, download_path: Optional[str] = None, account: Optional[str] = None) -> str:
     """
     Download files from a Canvas course.
     
     Args:
         course_id: Canvas course ID
         download_path: Path to download files to (optional, will use default if not provided)
+        account: School account to use (defaults to the active account)
     """
     try:
-        downloader = CanvasDownloader()
+        downloader = CanvasDownloader(account)
         
         # Validate course_id
         courses = downloader.get_current_courses()

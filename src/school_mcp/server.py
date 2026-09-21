@@ -179,6 +179,7 @@ async def download_course_files(course_id: int, download_path: Optional[str] = N
                       f"({result['stats']['skipped']} skipped, {result['stats']['failed']} failed)",
             "course_name": result["course_name"],
             "download_path": result["base_path"],
+            "notes": result.get("notes", []),
             "stats": result["stats"]
         }, indent=2)
     except Exception as e:

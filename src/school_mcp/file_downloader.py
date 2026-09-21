@@ -2,12 +2,20 @@
 
 import re
 import os
+import html
 import mimetypes
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
+from urllib.parse import urlparse, parse_qs
 import requests
 from canvasapi import Canvas
-from .config import get_config, get_download_path, save_download_path
+from .config import get_config, get_download_path
+
+# Canvas file links inside HTML, e.g. /courses/40243/files/6852894?verifier=...&wrap=1
+# or the API form /api/v1/courses/40243/files/6852894. Group 1 is the file id,
+# group 2 the optional query string.
+FILE_LINK_RE = re.compile(r'/files/(\d+)(?:/[\w-]*)?(\?[^"\'\s<>]*)?')
 
 class CanvasDownloader:
     """Class for downloading files from Canvas."""
@@ -22,8 +30,9 @@ class CanvasDownloader:
         try:
             config = get_config(account)
             self.account = config['account']
-            domain = config['canvas_domain'].replace('https://', '').replace('http://', '')
-            self.canvas = Canvas(f'https://{domain}', config['canvas_access_token'])
+            self.domain = config['canvas_domain'].replace('https://', '').replace('http://', '')
+            self.token = config['canvas_access_token']
+            self.canvas = Canvas(f'https://{self.domain}', self.token)
         except Exception as e:
             raise ValueError(f"Error initializing CanvasDownloader: {str(e)}")
 
@@ -77,7 +86,12 @@ class CanvasDownloader:
     def download_file(self, url: str, filepath: Path, filename: str = None) -> Dict[str, Any]:
         """Download a file and return status information."""
         try:
-            response = requests.get(url, stream=True)
+            # Canvas-hosted URLs need the token; requests drops it on redirects
+            # to other hosts (e.g. the file store), so it never leaks.
+            headers = {}
+            if urlparse(url).hostname == self.domain:
+                headers['Authorization'] = f'Bearer {self.token}'
+            response = requests.get(url, stream=True, headers=headers)
             response.raise_for_status()
             
             if not filename:
@@ -132,181 +146,157 @@ class CanvasDownloader:
                 "message": f"Error downloading file: {str(e)}"
             }
 
+    def _file_links(self, markup: Optional[str]) -> Dict[int, Optional[str]]:
+        """
+        Canvas file ids linked from an HTML body, mapped to their `verifier`
+        (None when a link has none). A verifier lets a student fetch the file
+        even when the course's Files tab is disabled.
+        """
+        links: Dict[int, Optional[str]] = {}
+        for file_id, query in FILE_LINK_RE.findall(html.unescape(markup or '')):
+            verifier = parse_qs(query.lstrip('?')).get('verifier', [None])[0] if query else None
+            fid = int(file_id)
+            if links.get(fid) is None:
+                links[fid] = verifier
+        return links
+
     def download_all_course_files(self, course_id: int, download_path: Optional[str] = None) -> Dict[str, Any]:
-        """Download all files from a course."""
+        """
+        Download every file reachable in a course: module items, assignment
+        attachments and links in assignment descriptions, the Files tab, and
+        links in Pages and announcements. Each file is fetched once (deduped by
+        file id), under the first section it turns up in.
+
+        download_path is the root for this run only; it does not change the
+        saved default (see config.save_download_path).
+        """
         try:
             course = self.canvas.get_course(course_id)
             course_name = self.sanitize_filename(course.name)
-            
-            if download_path:
-                base_path = Path(download_path) / course_name
-                save_download_path(download_path)
-            else:
-                base_path = Path(get_download_path()) / course_name
-            
+            base_path = Path(download_path or get_download_path()).expanduser() / course_name
             base_path.mkdir(parents=True, exist_ok=True)
-            
-            # Track downloads
-            total_files = 0
-            successful = 0
-            failed = 0
-            skipped = 0
-            download_results = []
-            
-            # Create result object
-            result = {
-                "course_name": course.name,
-                "base_path": str(base_path),
-                "files": download_results,
-                "stats": {
-                    "total": 0,
-                    "successful": 0,
-                    "failed": 0,
-                    "skipped": 0
-                }
-            }
-            
-            # Download module files
+
+            files: List[Dict[str, Any]] = []
+            notes: List[str] = []
+            stats = {"total": 0, "successful": 0, "failed": 0, "skipped": 0, "locked": 0}
+            seen: set = set()
+
+            def record(info: Dict[str, Any]) -> None:
+                files.append(info)
+                stats["total"] += 1
+                key = {"success": "successful", "skipped": "skipped",
+                       "locked": "locked"}.get(info["status"], "failed")
+                stats[key] += 1
+
+            def section_error(name: str, path: Path, e: Exception) -> None:
+                files.append({"status": "error", "filename": name, "path": str(path),
+                              "message": f"Error processing {name}: {str(e)}"})
+
+            def fetch_by_id(file_id: int, dest: Path, verifier: Optional[str] = None,
+                            label: str = '') -> None:
+                """Look a file up by id (with its verifier if any) and download it once."""
+                if file_id in seen:
+                    return
+                seen.add(file_id)
+                try:
+                    kwargs = {'verifier': verifier} if verifier else {}
+                    f = self.canvas.get_file(file_id, **kwargs)
+                    name = getattr(f, 'display_name', None) or f.filename
+                    if getattr(f, 'locked_for_user', False) or not getattr(f, 'url', None):
+                        record({"status": "locked", "filename": name, "path": str(dest),
+                                "message": getattr(f, 'lock_explanation', None) or "File is locked"})
+                        return
+                    record(self.download_file(f.url, dest, name))
+                except Exception as e:
+                    record({"status": "error", "filename": label or f"file {file_id}",
+                            "path": str(dest), "message": f"Error downloading file: {str(e)}"})
+
+            def fetch_links(markup: Optional[str], dest: Path) -> None:
+                for file_id, verifier in self._file_links(markup).items():
+                    fetch_by_id(file_id, dest, verifier)
+
+            # Modules
             try:
-                modules = course.get_modules()
-                
-                for module in modules:
+                for module in course.get_modules():
                     module_path = base_path / "Modules" / self.sanitize_filename(module.name)
                     current_section = None
-                    
                     try:
-                        items = module.get_module_items()
-                        for item in items:
-                            # Check for section headers
+                        for item in module.get_module_items():
                             if item.type == 'SubHeader' or (item.type == 'ExternalUrl' and item.title):
                                 section_num, section_name = self._extract_section_info(item.title)
                                 if section_num and section_name:
                                     current_section = f"{section_num} - {section_name}"
-                            
-                            # Handle files
                             elif item.type == 'File':
-                                try:
-                                    file = course.get_file(item.content_id)
-                                    download_path = module_path
-                                    if current_section:
-                                        download_path = module_path / self.sanitize_filename(current_section)
-                                    
-                                    result_info = self.download_file(file.url, download_path, file.filename)
-                                    download_results.append(result_info)
-                                    
-                                    total_files += 1
-                                    if result_info["status"] == "success":
-                                        successful += 1
-                                    elif result_info["status"] == "skipped":
-                                        skipped += 1
-                                    else:
-                                        failed += 1
-                                        
-                                except Exception as e:
-                                    download_results.append({
-                                        "status": "error",
-                                        "filename": item.title,
-                                        "path": str(module_path),
-                                        "message": f"Error downloading file: {str(e)}"
-                                    })
-                                    total_files += 1
-                                    failed += 1
+                                dest = module_path
+                                if current_section:
+                                    dest = module_path / self.sanitize_filename(current_section)
+                                fetch_by_id(item.content_id, dest, label=item.title)
                     except Exception as e:
-                        download_results.append({
-                            "status": "error",
-                            "filename": f"Module {module.name}",
-                            "path": str(module_path),
-                            "message": f"Error processing module items: {str(e)}"
-                        })
+                        section_error(f"module {module.name}", module_path, e)
             except Exception as e:
-                download_results.append({
-                    "status": "error",
-                    "filename": "Modules",
-                    "path": str(base_path / "Modules"),
-                    "message": f"Error processing modules: {str(e)}"
-                })
+                section_error("modules", base_path / "Modules", e)
 
-            # Download assignment files
+            # Assignments: direct attachments and files linked from the description
+            assignment_path = base_path / "Assignments"
             try:
-                assignments = course.get_assignments()
-                assignment_path = base_path / "Assignments"
-                
-                for assignment in assignments:
-                    current_path = assignment_path / self.sanitize_filename(assignment.name)
-                    
-                    # Download description attachments
-                    if hasattr(assignment, 'description'):
-                        urls = re.findall(r'href="([^"]+)"', assignment.description or '')
-                        for url in urls:
-                            if '/files/' in url and '/preview' not in url:
-                                try:
-                                    file_id = url.split('/files/')[-1].split('/')[0]
-                                    file = course.get_file(file_id)
-                                    result_info = self.download_file(file.url, current_path)
-                                    download_results.append(result_info)
-                                    
-                                    total_files += 1
-                                    if result_info["status"] == "success":
-                                        successful += 1
-                                    elif result_info["status"] == "skipped":
-                                        skipped += 1
-                                    else:
-                                        failed += 1
-                                except Exception:
-                                    continue
-                    
-                    # Download direct attachments
-                    if hasattr(assignment, 'attachments'):
-                        for attachment in assignment.attachments:
-                            result_info = self.download_file(attachment['url'], current_path, attachment['filename'])
-                            download_results.append(result_info)
-                            
-                            total_files += 1
-                            if result_info["status"] == "success":
-                                successful += 1
-                            elif result_info["status"] == "skipped":
-                                skipped += 1
-                            else:
-                                failed += 1
+                for assignment in course.get_assignments():
+                    dest = assignment_path / self.sanitize_filename(assignment.name)
+                    for attachment in getattr(assignment, 'attachments', None) or []:
+                        if attachment.get('id') in seen:
+                            continue
+                        seen.add(attachment.get('id'))
+                        record(self.download_file(attachment['url'], dest,
+                                                  attachment.get('display_name') or attachment['filename']))
+                    fetch_links(getattr(assignment, 'description', None), dest)
             except Exception as e:
-                download_results.append({
-                    "status": "error",
-                    "filename": "Assignments",
-                    "path": str(assignment_path),
-                    "message": f"Error processing assignments: {str(e)}"
-                })
+                section_error("assignments", assignment_path, e)
 
-            # Download course files
+            # Files tab (often disabled for students)
+            files_path = base_path / "Files"
             try:
-                files = course.get_files()
-                files_path = base_path / "Files"
-                
-                for file in files:
-                    result_info = self.download_file(file.url, files_path, file.filename)
-                    download_results.append(result_info)
-                    
-                    total_files += 1
-                    if result_info["status"] == "success":
-                        successful += 1
-                    elif result_info["status"] == "skipped":
-                        skipped += 1
-                    else:
-                        failed += 1
+                for f in course.get_files():
+                    if f.id in seen:
+                        continue
+                    seen.add(f.id)
+                    record(self.download_file(f.url, files_path, getattr(f, 'display_name', None) or f.filename))
             except Exception as e:
-                download_results.append({
-                    "status": "error",
-                    "filename": "Files",
-                    "path": str(base_path / "Files"),
-                    "message": f"Error processing course files: {str(e)}"
-                })
-            
-            # Update stats
-            result["stats"]["total"] = total_files
-            result["stats"]["successful"] = successful
-            result["stats"]["failed"] = failed
-            result["stats"]["skipped"] = skipped
-            
-            return result
-            
+                if 'unauthorized' in str(e).lower():
+                    notes.append("Files tab is disabled for students in this course; "
+                                 "fetched linked files instead.")
+                else:
+                    section_error("course files", files_path, e)
+
+            # Pages
+            pages_path = base_path / "Pages"
+            try:
+                for page in course.get_pages():
+                    body = getattr(course.get_page(page.url), 'body', None)
+                    fetch_links(body, pages_path / self.sanitize_filename(page.title))
+            except Exception as e:
+                if 'not found' in str(e).lower() or 'unauthorized' in str(e).lower():
+                    notes.append("Pages are not available in this course.")
+                else:
+                    section_error("pages", pages_path, e)
+
+            # Announcements (all of them, not just the recent ones)
+            ann_path = base_path / "Announcements"
+            try:
+                start = getattr(course, 'start_at', None) or '2000-01-01'
+                end = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
+                for topic in self.canvas.get_announcements(
+                        context_codes=[f"course_{course.id}"], start_date=start[:10], end_date=end):
+                    fetch_links(getattr(topic, 'message', None),
+                                ann_path / self.sanitize_filename(topic.title))
+            except Exception as e:
+                section_error("announcements", ann_path, e)
+
+            return {
+                "course_name": course.name,
+                "base_path": str(base_path),
+                "files": files,
+                "notes": notes,
+                "stats": stats,
+            }
+
         except Exception as e:
             raise ValueError(f"Error downloading course files: {str(e)}")

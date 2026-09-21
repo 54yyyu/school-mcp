@@ -317,10 +317,14 @@ def grades(course, account, as_json):
 @main.command()
 @click.argument('course')
 @click.option('-p', '--path', default=None,
-              help='Download root; also saved as the new default (see `cw download-path`).')
+              help='Download root for this run only (the saved default is set with `cw download-path`).')
 @with_account
 def download(course, path, account, as_json):
-    """Download all files of a course (modules, assignment attachments, Files tab).
+    """Download all files of a course.
+
+    Covers modules, assignments (attachments and files linked in the
+    description), the Files tab, and files linked from Pages and announcements.
+    Linked files are fetched even when the Files tab is disabled.
 
     COURSE is an id, code (20.201) or name fragment. Files land in
     <download root>/<course name>/; files already present with the same size are skipped.
@@ -334,9 +338,14 @@ def download(course, path, account, as_json):
         return emit_json(result)
     s = result['stats']
     click.echo(f"{result['course_name']} -> {result['base_path']}")
-    click.echo(f"{s['successful']} downloaded, {s['skipped']} skipped, {s['failed']} failed")
+    locked = f", {s['locked']} locked" if s.get('locked') else ''
+    click.echo(f"{s['successful']} downloaded, {s['skipped']} skipped{locked}, {s['failed']} failed")
+    for note in result.get('notes', []):
+        click.echo(f"  note: {note}")
     for f in result['files']:
-        if f['status'] == 'error':
+        if f['status'] == 'locked':
+            click.echo(f"  locked: {f['filename']}: {f['message']}")
+        elif f['status'] == 'error':
             click.echo(f"  failed: {f['filename']}: {f['message']}")
 
 
@@ -344,11 +353,14 @@ def download(course, path, account, as_json):
 @click.argument('path', required=False)
 @common
 def download_path(path, as_json):
-    """Show the default download root, or set it to PATH."""
+    """Show the default download root, or set it to PATH (created if missing)."""
     if path:
         path = os.path.abspath(os.path.expanduser(path))
+        if os.path.exists(path) and not os.path.isdir(path):
+            raise click.ClickException(f"'{path}' exists and is not a directory.")
         if not os.path.isdir(path):
-            raise click.ClickException(f"'{path}' is not an existing directory.")
+            os.makedirs(path)
+            status(f"Created {path}")
         save_download_path(path)
     current = get_download_path()
     if as_json:

@@ -75,7 +75,28 @@ Or use the convenience script:
 ./run_server.py
 ```
 
-## Tools
+## CLI: `cw` / `coursework`
+
+`pip install -e .` also installs a command-line tool, `cw` (long name `coursework`):
+
+```bash
+cw deadlines                 # unsubmitted work due in the next 14 days (Canvas + Gradescope)
+cw deadlines -s canvas -d 7  # Canvas only, next week
+cw announcements -u          # unread course announcements
+cw inbox -u                  # unread Canvas inbox conversations
+cw message 512758            # read a thread (does not mark it read)
+cw grades 20.201             # per-assignment scores for one course
+cw download crispr           # download a course's files
+cw use columbia              # switch the active account
+```
+
+Courses can be named by code, name fragment or Canvas id. Every command has
+`-h`, `--json`, and (where it talks to a school) `-a ACCOUNT`.
+
+A Claude Code skill for the CLI lives in `skill/coursework/`; symlink it into
+`~/.claude/skills/` to make it available in every session.
+
+## MCP Tools
 
 - `get_deadlines`: Fetch upcoming assignment deadlines from Canvas and Gradescope
 - `add_to_reminders`: Add assignments to macOS Reminders

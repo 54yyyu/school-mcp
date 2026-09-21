@@ -31,12 +31,13 @@ class Assignment:
 class DeadlineScraper:
     """Class for scraping deadlines from Canvas and Gradescope."""
     
-    def __init__(self, account: Optional[str] = None):
+    def __init__(self, account: Optional[str] = None, include_gradescope: bool = True):
         """
         Initialize connections to Canvas and, when configured, Gradescope.
 
         Args:
             account: Name of the configured account to use (defaults to the active one)
+            include_gradescope: Set False to skip the Gradescope login entirely
         """
         try:
             config = get_config(account)
@@ -44,7 +45,8 @@ class DeadlineScraper:
             
             # Initialize Gradescope only for accounts that have credentials for it
             self.gs_connection = None
-            if has_gradescope(config):
+            self.gradescope_configured = has_gradescope(config)
+            if include_gradescope and self.gradescope_configured:
                 self.gs_connection = GSConnection()
                 self.gs_connection.login(
                     config['gradescope_email'], 
@@ -229,12 +231,13 @@ class DeadlineScraper:
         except Exception as e:
             raise ValueError(f"Error fetching Canvas assignments: {str(e)}")
 
-    def get_all_assignments(self, days_ahead: int = 14) -> List[Dict[str, Any]]:
+    def get_all_assignments(self, days_ahead: int = 14,
+                            include_canvas: bool = True) -> List[Dict[str, Any]]:
         """Get all assignments from Canvas and Gradescope as a list of dictionaries."""
         try:
             # Get assignments from both platforms
             gradescope_assignments = self.get_gradescope_assignments(days_ahead)
-            canvas_assignments = self.get_canvas_assignments(days_ahead)
+            canvas_assignments = self.get_canvas_assignments(days_ahead) if include_canvas else []
             
             # Combine assignments
             all_assignments = gradescope_assignments + canvas_assignments

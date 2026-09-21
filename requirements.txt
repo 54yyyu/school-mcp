@@ -6,3 +6,5 @@ pytz
 httpx
 tqdm
 python-dotenv
+click>=8.0
+requests

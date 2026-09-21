@@ -16,7 +16,14 @@ dependencies = [
     "httpx",
     "tqdm",
     "python-dotenv",
+    "click>=8.0",
+    "requests",
 ]
+
+[project.scripts]
+coursework = "school_mcp.cli:main"
+cw = "school_mcp.cli:main"
+school-mcp = "school_mcp.__main__:main"
 
 [project.optional-dependencies]
 dev = [

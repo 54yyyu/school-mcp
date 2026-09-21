@@ -146,14 +146,59 @@ async def list_courses(account: Optional[str] = None) -> str:
     except Exception as e:
         return f"Error listing courses: {str(e)}"
 
+def _parse_since(since: Optional[str]):
+    """'YYYY-MM-DD' or 'Nd' (N days ago) -> aware datetime, or None."""
+    if not since:
+        return None
+    from datetime import datetime, timedelta
+    v = since.strip().lower()
+    if v.endswith('d') and v[:-1].isdigit():
+        return datetime.now().astimezone() - timedelta(days=int(v[:-1]))
+    return datetime.fromisoformat(since).astimezone()
+
 @mcp.tool()
-async def download_course_files(course_id: int, download_path: Optional[str] = None, account: Optional[str] = None) -> str:
+async def list_course_files(course: str, since: Optional[str] = None,
+                            compare_dir: Optional[str] = None,
+                            account: Optional[str] = None) -> str:
     """
-    Download files from a Canvas course.
+    List every file download_course_files would fetch for a course, without
+    downloading: modules, assignments (attachments + description links), Files
+    tab, Pages, announcements, deduped by file id.
+
+    Args:
+        course: Course id, code (e.g. "20.201") or name fragment
+        since: Only files created/updated since this date (YYYY-MM-DD) or N days ago ("7d")
+        compare_dir: Local folder to check against; each file gets local.status
+            have / changed / missing (matched by name+size, then content hash; any layout)
+        account: School account to use (defaults to the active account)
+    """
+    try:
+        from .canvas_reader import CanvasReader
+        from .file_downloader import compare_with_local, filter_since
+        c = CanvasReader(account).resolve_course(course)
+        downloader = CanvasDownloader(account)
+        listing = downloader.list_course_files(c.id)
+        listing["files"] = filter_since(listing["files"], _parse_since(since))
+        if compare_dir:
+            compare_with_local(listing["files"], compare_dir, downloader)
+        return json.dumps(listing, indent=2, default=str)
+    except Exception as e:
+        return f"Error listing course files: {str(e)}"
+
+@mcp.tool()
+async def download_course_files(course_id: int, download_path: Optional[str] = None,
+                                file_ids: Optional[List[int]] = None,
+                                since: Optional[str] = None, flat: bool = False,
+                                account: Optional[str] = None) -> str:
+    """
+    Download files from a Canvas course (all of them, or a selection).
     
     Args:
         course_id: Canvas course ID
-        download_path: Path to download files to (optional, will use default if not provided)
+        download_path: Root to download into for this call (default: the saved download path; never changes it)
+        file_ids: Only these file ids (from list_course_files)
+        since: Only files created/updated since YYYY-MM-DD or N days ago ("7d")
+        flat: Put files directly in the root instead of <course>/<section>/ folders
         account: School account to use (defaults to the active account)
     """
     try:
@@ -166,21 +211,20 @@ async def download_course_files(course_id: int, download_path: Optional[str] = N
         if not course_exists:
             return f"Course with ID {course_id} not found."
         
-        # Use default path if none provided
-        if not download_path:
-            download_path = get_download_path()
-        
-        # Download files
-        result = downloader.download_all_course_files(course_id, download_path)
+        result = downloader.download_all_course_files(
+            course_id, download_path, file_ids=file_ids,
+            since=_parse_since(since), flat=flat)
         
         return json.dumps({
             "status": "success",
             "message": f"Downloaded {result['stats']['successful']} files " +
-                      f"({result['stats']['skipped']} skipped, {result['stats']['failed']} failed)",
+                      f"({result['stats']['skipped']} skipped, {result['stats']['locked']} locked, " +
+                      f"{result['stats']['failed']} failed)",
             "course_name": result["course_name"],
             "download_path": result["base_path"],
             "notes": result.get("notes", []),
-            "stats": result["stats"]
+            "stats": result["stats"],
+            "problems": [f for f in result["files"] if f["status"] in ("error", "locked")],
         }, indent=2)
     except Exception as e:
         return f"Error downloading course files: {str(e)}"

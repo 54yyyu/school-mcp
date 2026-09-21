@@ -3,6 +3,7 @@
 import re
 import os
 import html
+import hashlib
 import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -160,26 +161,160 @@ class CanvasDownloader:
                 links[fid] = verifier
         return links
 
-    def download_all_course_files(self, course_id: int, download_path: Optional[str] = None) -> Dict[str, Any]:
+    def _entry(self, f: Any, source: str, source_name: str, rel_dir: str) -> Dict[str, Any]:
+        """Normalize a canvasapi File or an assignment attachment dict into a listing entry."""
+        get = f.get if isinstance(f, dict) else (lambda k, d=None: getattr(f, k, d))
+        name = get('display_name') or get('filename') or f"file {get('id')}"
+        locked = bool(get('locked_for_user')) or not get('url')
+        return {
+            "id": get('id'),
+            "display_name": name,
+            "size": get('size'),
+            "content_type": get('content-type'),
+            "created_at": get('created_at'),
+            "updated_at": get('updated_at'),
+            "modified_at": get('modified_at'),
+            "source": source,
+            "source_name": source_name,
+            "rel_path": str(Path(rel_dir) / self.sanitize_filename(name)),
+            "locked": locked,
+            "lock_explanation": (get('lock_explanation') or "File is locked") if locked else None,
+            "url": get('url'),
+        }
+
+    def list_course_files(self, course_id: int) -> Dict[str, Any]:
         """
-        Download every file reachable in a course: module items, assignment
-        attachments and links in assignment descriptions, the Files tab, and
-        links in Pages and announcements. Each file is fetched once (deduped by
-        file id), under the first section it turns up in.
+        Discover every file reachable in a course without downloading anything:
+        module items, assignment attachments and description links, the Files
+        tab, and links in Pages and announcements. Each file appears once
+        (deduped by file id), under the first section it turns up in.
+
+        Returns course_name, files (entries with id, display_name, size, dates,
+        source, rel_path, locked, url), notes, and errors (non-fatal).
+        """
+        course = self.canvas.get_course(course_id)
+        files: List[Dict[str, Any]] = []
+        notes: List[str] = []
+        errors: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        def add(f: Any, source: str, source_name: str, rel_dir: str) -> None:
+            fid = f.get('id') if isinstance(f, dict) else getattr(f, 'id', None)
+            if fid in seen:
+                return
+            seen.add(fid)
+            files.append(self._entry(f, source, source_name, rel_dir))
+
+        def add_by_id(file_id: int, source: str, source_name: str, rel_dir: str,
+                      verifier: Optional[str] = None) -> None:
+            """Look a file up by id (with its verifier if any) and add it once."""
+            if file_id in seen:
+                return
+            try:
+                kwargs = {'verifier': verifier} if verifier else {}
+                add(self.canvas.get_file(file_id, **kwargs), source, source_name, rel_dir)
+            except Exception as e:
+                seen.add(file_id)
+                errors.append({"file_id": file_id, "source": source, "source_name": source_name,
+                               "message": f"Could not look up file: {str(e)}"})
+
+        def add_links(markup: Optional[str], source: str, source_name: str, rel_dir: str) -> None:
+            for file_id, verifier in self._file_links(markup).items():
+                add_by_id(file_id, source, source_name, rel_dir, verifier)
+
+        def section_error(name: str, e: Exception) -> None:
+            errors.append({"file_id": None, "source": name, "source_name": None,
+                           "message": f"Error processing {name}: {str(e)}"})
+
+        # Modules
+        try:
+            for module in course.get_modules():
+                module_dir = Path("Modules") / self.sanitize_filename(module.name)
+                current_section = None
+                try:
+                    for item in module.get_module_items():
+                        if item.type == 'SubHeader' or (item.type == 'ExternalUrl' and item.title):
+                            section_num, section_name = self._extract_section_info(item.title)
+                            if section_num and section_name:
+                                current_section = f"{section_num} - {section_name}"
+                        elif item.type == 'File':
+                            rel_dir = module_dir
+                            if current_section:
+                                rel_dir = module_dir / self.sanitize_filename(current_section)
+                            add_by_id(item.content_id, "module", module.name, str(rel_dir))
+                except Exception as e:
+                    section_error(f"module {module.name}", e)
+        except Exception as e:
+            section_error("modules", e)
+
+        # Assignments: direct attachments and files linked from the description
+        try:
+            for assignment in course.get_assignments():
+                rel_dir = str(Path("Assignments") / self.sanitize_filename(assignment.name))
+                for attachment in getattr(assignment, 'attachments', None) or []:
+                    add(attachment, "assignment", assignment.name, rel_dir)
+                add_links(getattr(assignment, 'description', None), "assignment", assignment.name, rel_dir)
+        except Exception as e:
+            section_error("assignments", e)
+
+        # Files tab (often disabled for students)
+        try:
+            for f in course.get_files():
+                add(f, "files_tab", "Files", "Files")
+        except Exception as e:
+            if 'unauthorized' in str(e).lower():
+                notes.append("Files tab is disabled for students in this course; "
+                             "listed linked files instead.")
+            else:
+                section_error("course files", e)
+
+        # Pages
+        try:
+            for page in course.get_pages():
+                body = getattr(course.get_page(page.url), 'body', None)
+                add_links(body, "page", page.title,
+                          str(Path("Pages") / self.sanitize_filename(page.title)))
+        except Exception as e:
+            if 'not found' in str(e).lower() or 'unauthorized' in str(e).lower():
+                notes.append("Pages are not available in this course.")
+            else:
+                section_error("pages", e)
+
+        # Announcements (all of them, not just the recent ones)
+        try:
+            start = getattr(course, 'start_at', None) or '2000-01-01'
+            end = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
+            for topic in self.canvas.get_announcements(
+                    context_codes=[f"course_{course.id}"], start_date=start[:10], end_date=end):
+                add_links(getattr(topic, 'message', None), "announcement", topic.title,
+                          str(Path("Announcements") / self.sanitize_filename(topic.title)))
+        except Exception as e:
+            section_error("announcements", e)
+
+        return {"course_id": course.id, "course_name": course.name,
+                "files": files, "notes": notes, "errors": errors}
+
+    def download_all_course_files(self, course_id: int, download_path: Optional[str] = None,
+                                  file_ids: Optional[List[int]] = None,
+                                  since: Optional[datetime] = None,
+                                  flat: bool = False) -> Dict[str, Any]:
+        """
+        Download a course's files, as discovered by list_course_files.
 
         download_path is the root for this run only; it does not change the
-        saved default (see config.save_download_path).
+        saved default. file_ids / since restrict the run to those files. With
+        flat=True files go straight into the root instead of
+        <root>/<course>/<section>/.
         """
         try:
-            course = self.canvas.get_course(course_id)
-            course_name = self.sanitize_filename(course.name)
-            base_path = Path(download_path or get_download_path()).expanduser() / course_name
+            listing = self.list_course_files(course_id)
+            root = Path(download_path or get_download_path()).expanduser()
+            base_path = root if flat else root / self.sanitize_filename(listing["course_name"])
             base_path.mkdir(parents=True, exist_ok=True)
 
+            entries = filter_since(listing["files"], since)
             files: List[Dict[str, Any]] = []
-            notes: List[str] = []
             stats = {"total": 0, "successful": 0, "failed": 0, "skipped": 0, "locked": 0}
-            seen: set = set()
 
             def record(info: Dict[str, Any]) -> None:
                 files.append(info)
@@ -188,115 +323,137 @@ class CanvasDownloader:
                        "locked": "locked"}.get(info["status"], "failed")
                 stats[key] += 1
 
-            def section_error(name: str, path: Path, e: Exception) -> None:
-                files.append({"status": "error", "filename": name, "path": str(path),
-                              "message": f"Error processing {name}: {str(e)}"})
+            if file_ids is not None:
+                wanted = set(file_ids)
+                entries = [e for e in entries if e["id"] in wanted]
+                for missing in sorted(wanted - {e["id"] for e in entries}):
+                    record({"status": "error", "filename": f"file {missing}", "path": str(base_path),
+                            "message": "Not found among this course's files"
+                                       + (" (or older than --since)" if since else "")})
+            else:
+                # Files that could not even be looked up count as failures of a full run
+                for err in listing["errors"]:
+                    if err["file_id"] is not None:
+                        record({"status": "error", "filename": f"file {err['file_id']}",
+                                "path": str(base_path), "message": err["message"]})
+                    else:
+                        files.append({"status": "error", "filename": err["source"],
+                                      "path": str(base_path), "message": err["message"]})
 
-            def fetch_by_id(file_id: int, dest: Path, verifier: Optional[str] = None,
-                            label: str = '') -> None:
-                """Look a file up by id (with its verifier if any) and download it once."""
-                if file_id in seen:
-                    return
-                seen.add(file_id)
-                try:
-                    kwargs = {'verifier': verifier} if verifier else {}
-                    f = self.canvas.get_file(file_id, **kwargs)
-                    name = getattr(f, 'display_name', None) or f.filename
-                    if getattr(f, 'locked_for_user', False) or not getattr(f, 'url', None):
-                        record({"status": "locked", "filename": name, "path": str(dest),
-                                "message": getattr(f, 'lock_explanation', None) or "File is locked"})
-                        return
-                    record(self.download_file(f.url, dest, name))
-                except Exception as e:
-                    record({"status": "error", "filename": label or f"file {file_id}",
-                            "path": str(dest), "message": f"Error downloading file: {str(e)}"})
-
-            def fetch_links(markup: Optional[str], dest: Path) -> None:
-                for file_id, verifier in self._file_links(markup).items():
-                    fetch_by_id(file_id, dest, verifier)
-
-            # Modules
-            try:
-                for module in course.get_modules():
-                    module_path = base_path / "Modules" / self.sanitize_filename(module.name)
-                    current_section = None
-                    try:
-                        for item in module.get_module_items():
-                            if item.type == 'SubHeader' or (item.type == 'ExternalUrl' and item.title):
-                                section_num, section_name = self._extract_section_info(item.title)
-                                if section_num and section_name:
-                                    current_section = f"{section_num} - {section_name}"
-                            elif item.type == 'File':
-                                dest = module_path
-                                if current_section:
-                                    dest = module_path / self.sanitize_filename(current_section)
-                                fetch_by_id(item.content_id, dest, label=item.title)
-                    except Exception as e:
-                        section_error(f"module {module.name}", module_path, e)
-            except Exception as e:
-                section_error("modules", base_path / "Modules", e)
-
-            # Assignments: direct attachments and files linked from the description
-            assignment_path = base_path / "Assignments"
-            try:
-                for assignment in course.get_assignments():
-                    dest = assignment_path / self.sanitize_filename(assignment.name)
-                    for attachment in getattr(assignment, 'attachments', None) or []:
-                        if attachment.get('id') in seen:
-                            continue
-                        seen.add(attachment.get('id'))
-                        record(self.download_file(attachment['url'], dest,
-                                                  attachment.get('display_name') or attachment['filename']))
-                    fetch_links(getattr(assignment, 'description', None), dest)
-            except Exception as e:
-                section_error("assignments", assignment_path, e)
-
-            # Files tab (often disabled for students)
-            files_path = base_path / "Files"
-            try:
-                for f in course.get_files():
-                    if f.id in seen:
-                        continue
-                    seen.add(f.id)
-                    record(self.download_file(f.url, files_path, getattr(f, 'display_name', None) or f.filename))
-            except Exception as e:
-                if 'unauthorized' in str(e).lower():
-                    notes.append("Files tab is disabled for students in this course; "
-                                 "fetched linked files instead.")
+            for e in entries:
+                dest = base_path if flat else base_path / Path(e["rel_path"]).parent
+                if e["locked"]:
+                    record({"status": "locked", "filename": e["display_name"], "path": str(dest),
+                            "message": e["lock_explanation"]})
                 else:
-                    section_error("course files", files_path, e)
-
-            # Pages
-            pages_path = base_path / "Pages"
-            try:
-                for page in course.get_pages():
-                    body = getattr(course.get_page(page.url), 'body', None)
-                    fetch_links(body, pages_path / self.sanitize_filename(page.title))
-            except Exception as e:
-                if 'not found' in str(e).lower() or 'unauthorized' in str(e).lower():
-                    notes.append("Pages are not available in this course.")
-                else:
-                    section_error("pages", pages_path, e)
-
-            # Announcements (all of them, not just the recent ones)
-            ann_path = base_path / "Announcements"
-            try:
-                start = getattr(course, 'start_at', None) or '2000-01-01'
-                end = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
-                for topic in self.canvas.get_announcements(
-                        context_codes=[f"course_{course.id}"], start_date=start[:10], end_date=end):
-                    fetch_links(getattr(topic, 'message', None),
-                                ann_path / self.sanitize_filename(topic.title))
-            except Exception as e:
-                section_error("announcements", ann_path, e)
+                    record(self.download_file(e["url"], dest, e["display_name"]))
 
             return {
-                "course_name": course.name,
+                "course_name": listing["course_name"],
                 "base_path": str(base_path),
                 "files": files,
-                "notes": notes,
+                "notes": listing["notes"],
                 "stats": stats,
             }
 
         except Exception as e:
             raise ValueError(f"Error downloading course files: {str(e)}")
+
+    def remote_sha256(self, url: str) -> str:
+        """Hash a Canvas file's content by streaming it, without saving it."""
+        headers = {}
+        if urlparse(url).hostname == self.domain:
+            headers['Authorization'] = f'Bearer {self.token}'
+        digest = hashlib.sha256()
+        with requests.get(url, stream=True, headers=headers) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(65536):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+
+def _timestamp(iso: Optional[str]) -> Optional[datetime]:
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def filter_since(entries: List[Dict[str, Any]], since: Optional[datetime]) -> List[Dict[str, Any]]:
+    """Entries created or updated at/after `since` (entries with no dates are kept)."""
+    if since is None:
+        return entries
+    kept = []
+    for e in entries:
+        stamps = [t for t in (_timestamp(e.get(k)) for k in ("created_at", "updated_at", "modified_at")) if t]
+        if not stamps or max(stamps) >= since:
+            kept.append(e)
+    return kept
+
+
+def _local_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compare_with_local(entries: List[Dict[str, Any]], local_dir: str,
+                       downloader: CanvasDownloader) -> None:
+    """
+    Mark each entry with `local`: {"status", "path"} by looking for it anywhere
+    under local_dir, independent of folder layout or renames. Read-only.
+
+    have     same size and same name, or same size and identical content (sha256)
+    changed  a file with the same name exists but its size differs
+    missing  nothing matches
+    """
+    root = Path(local_dir).expanduser()
+    if not root.is_dir():
+        raise ValueError(f"'{local_dir}' is not a directory.")
+
+    by_size: Dict[int, List[Path]] = {}
+    by_name: Dict[str, List[Path]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for fn in filenames:
+            if fn.startswith('.'):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                by_size.setdefault(p.stat().st_size, []).append(p)
+            except OSError:
+                continue
+            by_name.setdefault(fn.casefold(), []).append(p)
+
+    local_hashes: Dict[Path, str] = {}
+
+    def local_hash(p: Path) -> str:
+        if p not in local_hashes:
+            local_hashes[p] = _local_sha256(p)
+        return local_hashes[p]
+
+    for e in entries:
+        names = {e["display_name"].casefold(), Path(e["rel_path"]).name.casefold()}
+        same_size = by_size.get(e["size"], []) if e["size"] is not None else []
+        match = next((p for p in same_size if p.name.casefold() in names), None)
+
+        if match is None and same_size and not e["locked"]:
+            try:
+                remote = downloader.remote_sha256(e["url"])
+                match = next((p for p in same_size if local_hash(p) == remote), None)
+            except Exception:
+                match = None
+
+        if match is not None:
+            e["local"] = {"status": "have", "path": str(match)}
+            continue
+
+        named = [p for n in names for p in by_name.get(n, [])]
+        if named:
+            e["local"] = {"status": "changed", "path": str(named[0])}
+        else:
+            e["local"] = {"status": "missing", "path": None}

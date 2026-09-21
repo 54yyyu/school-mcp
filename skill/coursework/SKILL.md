@@ -14,7 +14,8 @@ description: Check the user's courses through the `cw` CLI — Canvas LMS (MIT, 
 | Inbox | `cw inbox` (`-u` unread), then `cw message ID` for the thread |
 | Grades | `cw grades` or `cw grades COURSE` |
 | Courses | `cw courses` |
-| Download course files | `cw download COURSE` |
+| What files a course has / what's new | `cw files COURSE` (`--since 7d`, `--compare DIR --missing`) |
+| Download course files | `cw download COURSE` (`--id ID`, `-p DIR`, `--flat`) |
 | Accounts | `cw accounts`, `cw use mit\|columbia` |
 | Reminders sync | `cw reminders` |
 
@@ -25,7 +26,7 @@ description: Check the user's courses through the `cw` CLI — Canvas LMS (MIT, 
 Ask before running these, since they change things:
 - `cw reminders`: wipes and rewrites a Reminders list.
 - `cw use`: switches the saved active account.
-- `cw download`: writes many files.
+- `cw download`: writes files. To sync, run `cw files COURSE --compare DIR --missing` first, then `cw download COURSE --id ...`. Never download into the user's own course folders unless asked.
 - `cw message --mark-read`: marks the thread read.
 
 Everything else is read-only. Reading a message does not mark it read.

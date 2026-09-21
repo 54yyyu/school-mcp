@@ -6,7 +6,7 @@ account for that one call; every command accepts --json for machine output.
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Optional
 
@@ -314,26 +314,124 @@ def grades(course, account, as_json):
 # Files
 # =====================
 
+def parse_since(value: Optional[str]) -> Optional[datetime]:
+    """'2026-09-20' (local midnight) or '7d' (7 days ago) -> aware datetime."""
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v.endswith('d') and v[:-1].isdigit():
+        return datetime.now().astimezone() - timedelta(days=int(v[:-1]))
+    try:
+        return datetime.fromisoformat(value).astimezone()
+    except ValueError:
+        raise click.BadParameter(f"'{value}' is not a date (YYYY-MM-DD) or a day count like 7d.",
+                                 param_hint="'--since'")
+
+
+def human_size(n: Optional[int]) -> str:
+    if n is None:
+        return '-'
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f"{n:.0f} {unit}" if unit == 'B' else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+SINCE_OPTION = click.option(
+    '--since', default=None,
+    help='Only files created/updated since DATE (YYYY-MM-DD) or N days ago (e.g. 7d).')
+
+
+@main.command()
+@click.argument('course')
+@SINCE_OPTION
+@click.option('--compare', 'compare_dir', type=click.Path(file_okay=False), default=None,
+              help='Mark each file have/changed/missing against a local folder (any layout; '
+                   'matches by name+size, then content hash). Read-only.')
+@click.option('--missing', 'only_missing', is_flag=True,
+              help='With --compare: show only files that are not "have".')
+@with_account
+def files(course, since, compare_dir, only_missing, account, as_json):
+    """List every file `cw download` would fetch for COURSE, without downloading.
+
+    Same discovery as `cw download`: modules, assignments, Files tab, Pages,
+    announcements, deduped by file id. Fetch selected ones with
+    `cw download COURSE --id ID ...`.
+    """
+    from .canvas_reader import CanvasReader
+    from .file_downloader import CanvasDownloader, compare_with_local, filter_since
+    if only_missing and not compare_dir:
+        raise click.UsageError('--missing needs --compare DIR.')
+    c = CanvasReader(account).resolve_course(course)
+    downloader = CanvasDownloader(account)
+    listing = downloader.list_course_files(c.id)
+    entries = filter_since(listing['files'], parse_since(since))
+    if compare_dir:
+        compare_with_local(entries, compare_dir, downloader)
+        if only_missing:
+            entries = [e for e in entries if e['local']['status'] != 'have']
+
+    if as_json:
+        out = dict(listing, files=entries)
+        return emit_json(out)
+
+    click.echo(f"{listing['course_name']}: {len(entries)} file(s)")
+    for e in entries:
+        mark = f"{e['local']['status']:<8} " if compare_dir else ''
+        stamp = local_time(e['updated_at'] or e['created_at'])
+        click.echo(f"{mark}{e['id']:<9} {human_size(e['size']):>9}  {stamp}  {e['display_name']}")
+        detail = f"{e['source']}: {e['source_name']}  -> {e['rel_path']}"
+        if e['locked']:
+            detail += f"  [locked: {e['lock_explanation']}]"
+        if compare_dir and e['local']['path']:
+            detail += f"  (local: {os.path.relpath(e['local']['path'], os.path.expanduser(compare_dir))})"
+        click.echo(f"{' ' * len(mark)}{'':<9} {detail}")
+    if compare_dir:
+        counts = {}
+        for e in entries:
+            counts[e['local']['status']] = counts.get(e['local']['status'], 0) + 1
+        click.echo('  '.join(f"{k}: {v}" for k, v in sorted(counts.items()))
+                   or 'Nothing missing: every file is already in the local folder.')
+    for note in listing['notes']:
+        click.echo(f"note: {note}")
+    for err in listing['errors']:
+        click.echo(f"error: {err['message']}")
+
+
 @main.command()
 @click.argument('course')
 @click.option('-p', '--path', default=None,
               help='Download root for this run only (the saved default is set with `cw download-path`).')
+@click.option('-i', '--id', 'file_ids', multiple=True,
+              help='Only these file ids (repeatable, or comma-separated); see `cw files`.')
+@SINCE_OPTION
+@click.option('--flat', is_flag=True,
+              help='Put files directly in the root, without <course>/<section>/ folders.')
 @with_account
-def download(course, path, account, as_json):
-    """Download all files of a course.
+def download(course, path, file_ids, since, flat, account, as_json):
+    """Download a course's files (all, or a selection).
 
     Covers modules, assignments (attachments and files linked in the
     description), the Files tab, and files linked from Pages and announcements.
-    Linked files are fetched even when the Files tab is disabled.
+    Linked files are fetched even when the Files tab is disabled. Preview the
+    list first with `cw files COURSE`.
 
     COURSE is an id, code (20.201) or name fragment. Files land in
-    <download root>/<course name>/; files already present with the same size are skipped.
+    <download root>/<course name>/<section>/; files already present with the
+    same size are skipped.
     """
     from .canvas_reader import CanvasReader
     from .file_downloader import CanvasDownloader
+    ids = None
+    if file_ids:
+        try:
+            ids = [int(x) for raw in file_ids for x in raw.replace(',', ' ').split()]
+        except ValueError:
+            raise click.BadParameter('file ids must be numbers.', param_hint="'--id'")
     c = CanvasReader(account).resolve_course(course)
     status(f"Downloading {c.name} ...")
-    result = CanvasDownloader(account).download_all_course_files(c.id, path)
+    result = CanvasDownloader(account).download_all_course_files(
+        c.id, path, file_ids=ids, since=parse_since(since), flat=flat)
     if as_json:
         return emit_json(result)
     s = result['stats']

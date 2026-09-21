@@ -86,7 +86,8 @@ cw announcements -u          # unread course announcements
 cw inbox -u                  # unread Canvas inbox conversations
 cw message 512758            # read a thread (does not mark it read)
 cw grades 20.201             # per-assignment scores for one course
-cw download crispr           # download a course's files
+cw files 6.7810 --compare ~/Desktop/MIT/6.7810 --missing   # what's not filed locally yet
+cw download crispr           # download a course's files (or --id ID ... for a selection)
 cw use columbia              # switch the active account
 ```
 

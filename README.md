@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/54yyyu-school-mcp-badge.png)](https://mseep.ai/app/54yyyu-school-mcp)
+
 # School MCP
 
 [![smithery badge](https://smithery.ai/badge/@54yyyu/school-mcp)](https://smithery.ai/server/@54yyyu/school-mcp)
